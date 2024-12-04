@@ -1,0 +1,632 @@
+/**
+ * @description Contains OneTrust Cookies Consent Javascript to be run client side
+ * OneTrust OptanonWrapper callback allows to execute Intuit specific business logic on any changes to consent.
+ * Example: set Intuit specific consent cookies such as ccpa and cpra.
+ */
+
+import { logConsent, logMessage } from './util/consent-logging';
+
+export class CookiesConsentWrapper {
+  static instance = null;
+  constructor() {
+    // add Singleton pattern check to prevent multiple instances
+
+    if (CookiesConsentWrapper.instance) {
+      return CookiesConsentWrapper.instance;
+    }
+    this.win = window;
+    this.config = {
+      // array of possible consent cookies across different geos
+      supportedIntuitCookies: ["cpra", "ccpa", "gdpr", "lgdp"],
+      oneTrustCookie: "OptanonConsent",
+      oneTrustBannerCookie: "OptanonAlertBoxClosed",
+      explicitConsentCookie: "pacflag"
+    };
+    this.categoryEnabled = '1';
+    this.categoryDisabled = '0';
+    // checks against array of supported cookies and returns the first match, else returns 'ccpa' as default
+    this.config.intuitCookie = this.getExistingConsentCookie(this.config.supportedIntuitCookies);
+    this.oneTrustCategories = {
+      essential: "1",
+      advertising: "4",
+    };
+    this.akamaiGeo = this.getAkesGeo();
+    this.gpcEnabled = this.checkGpcEnabled();
+    // override flag for GPC to always return false
+    this.overrideGpc = true; // TEMP: Always return false for now until we are ready to move forward with this feature
+    this.intuitToOnetrustMap = {
+      strictly_necessary_permission: this.oneTrustCategories.essential,
+      advertising_permission: this.oneTrustCategories.advertising,
+    };
+    this.oneTrustPreferences = {};
+    this.intuitPreferences = {};
+    (this.win.intuit_cookie_preferences =
+      this.win.intuit_cookie_preferences || {}),
+      (this.win.intuit_cookie_preferences.syncPreferences = () => {
+        this.syncPreferences();
+      });
+
+    this.defaultLawConfig = {
+      "regions": [
+        "US"
+      ],
+      "endpoints": [
+        "https://consent.intuit.com/api/sync",
+        "https://consent.intuit.tsheets.com/api/sync",
+        "https://consent.intuit.quickbooksconnect.com/api/sync",
+        "https://consent.www.firmofthefuture.com/api/sync",
+        "https://consent.mailchimp.com/api/sync"
+      ],
+      "checkboxes": [
+        {
+          "value": "strictly_necessary_permission",
+          "localizationTitleId": "strictlyNecessaryPermissionTitle",
+          "localizationBodyId": "strictlyNecessaryPermissionBodyCCPA",
+          "disabled": true,
+          "defaultChecked": true,
+          "essential": true
+        },
+        {
+          "value": "advertising_permission",
+          "localizationTitleId": "advertisingPermissionTitleCCPA",
+          "localizationBodyId": "advertisingPermissionBodyCCPA",
+          "disabled": false,
+          "defaultChecked": true
+        }
+      ],
+      "title": "titleCCPA",
+      "description": "descriptionCCPA"
+    }
+    this.initialize();
+    CookiesConsentWrapper.instance = this;
+  }
+  // reset instance function for jest testing only
+  resetInstance() {
+    CookiesConsentWrapper.instance = null;
+  }
+
+  initialize() {
+    const intuitCookie = CookiesConsentWrapper.getCookieValue(this.config.intuitCookie);
+    const oneTrustCookie = CookiesConsentWrapper.getCookieValue(this.config.oneTrustCookie);
+    let intuitCookieVal;
+    // add OneTrust preferences to the cookiesConsentWrapper object
+    if (typeof oneTrustCookie !== 'undefined') {
+      this.getOneTrustPreferences(oneTrustCookie);
+    }
+    // add intuit preferences to the cookiesConsentWrapper object
+    if (typeof intuitCookie !== 'undefined') {
+      this.mapIntuitPrefsToOneTrustCats(intuitCookie);
+    }
+    // check if intuit cookie exists
+    const hasIntuitCookie = typeof intuitCookie !== 'undefined';
+    if (hasIntuitCookie) intuitCookieVal = CookiesConsentWrapper.getCookieValue(this.config.intuitCookie);
+    // Check pre auth consent cookie and suppress banner if it exists
+    if (CookiesConsentWrapper.getCookieValue("pacflag")) {
+      this.suppressBanner('.intuit.com');
+      // else if no pacflag and hasIntuitCookie with value equal to 1|0 , suppress banner as user has opted out
+    } else if (hasIntuitCookie && intuitCookieVal == "1|0") {
+      this.suppressBanner('.intuit.com');
+    }
+
+    // sync preferences on page load
+    // If user is in CA and has opted out of GPC, set consent to opted out
+    if (this.optOutGpcUser(oneTrustCookie)) {
+      // update cookie to be opted out "1|0" and sync preferences
+      this.updatePreferences("1|0", "groups=1:1,4:0", ".intuit.com");
+    } else if (hasIntuitCookie) {
+      // add intuit preferences to the cookiesConsentWrapper object
+      this.mapIntuitPrefsToOneTrustCats(intuitCookie);
+      this.copyCookiePreferences(intuitCookie, oneTrustCookie, ".intuit.com");
+      // do not sync for select hosts on init during PACBT
+    } else if (/^(.*\.)?((my)?turbotax|ttlc|sh-exp-ttlc-e2e\.app|blog-turbotax-intuit-com-prelaunch\.go-vip)\.(intuit\.com|net)/i.test(window.location.host)) {
+      return;
+    } else {
+      // sync preferences on page load
+      this.syncPreferences();
+    }
+  }
+
+  /**
+   * @function extractActiveGroupsValues
+   * @description Extracts the active groups from the OneTrust cookie value
+   * @param {String} oneTrustCookieVal OneTrust cookie value
+   * @returns {Object} Object containing the active groups and their values
+   **/
+  extractActiveGroupsValues(oneTrustCookieVal) {
+    return this.isolateOneTrustGroups(oneTrustCookieVal).reduce((n, i) => {
+      let r = i.split(":");
+      return (n[r[0]] = r[1]), n;
+    }, {});
+  }
+
+  /**
+   * @function getOneTrustPreferences
+   * @description Returns the OneTrust preferences from OneTrust cookie
+   * @param {String} oneTrustCookieVal OneTrust cookie value
+   * @returns {Object} Object containing the OneTrust preferences key value pairs
+   **/
+  getOneTrustPreferences(oneTrustCookieVal) {
+    return (
+      Object.keys(this.getOneTrustPreferences).length === 0 &&
+      // set the preferences in the consent object
+      (this.oneTrustPreferences = CookiesConsentWrapper.oneTrustPreferences =
+        this.extractActiveGroupsValues(oneTrustCookieVal)),
+      this.oneTrustPreferences
+    );
+  }
+
+  /**
+  * @function mapIntuitPrefsToOneTrustCats
+  * @description Returns object with Intuit preferences (1 or 0) mapped to OneTrust categories
+  * @param {String} cookieValue Intuit cookie value
+  * @returns {Object} Object containing OT Cats to Intuit preferences key value pairs
+  **/
+  mapIntuitPrefsToOneTrustCats(cookieValue) {
+    // if no cookie value is passed, return an empty object
+    if (typeof cookieValue === 'undefined') {
+      return {};
+    }
+    const preferences = cookieValue.split('|');
+    this.intuitPreferences[
+      this.intuitToOnetrustMap.strictly_necessary_permission
+    ] = preferences[0];
+    this.intuitPreferences[this.intuitToOnetrustMap.advertising_permission] =
+      preferences[1];
+    return this.intuitPreferences;
+  }
+
+  /**
+   * @function getExistingConsentCookie
+   * @description Returns the first matching intui consent cookie name from the array of cookie names, sets default to ccpa if none found
+   * @param {Array} cookieNames Array of cookie names
+   * @returns {String} Returns the first matching cookie name from the array of cookie names, sets default to ccpa
+   **/
+  getExistingConsentCookie(cookieNames) {
+    if (!Array.isArray(cookieNames)) {
+      return 'ccpa'; // return a default val
+    }
+    const cookies = document.cookie.split('; ');
+    for (const cookie of cookies) {
+      const [name, value] = cookie.split('=');
+
+      if (cookieNames.includes(name)) {
+        return name;
+      }
+    }
+    return 'ccpa'; // return a default val
+  }
+
+  /**
+   * @function isolateOneTrustGroups
+   * @description Isolates the groups value from the OneTrust cookie value and returns an array of the groups
+   * @param {String} oneTrustCookieVal OneTrust cookie value
+   * @returns {Array} Array containing the groups value
+   **/
+  isolateOneTrustGroups(oneTrustCookieVal) {
+    // if no cookie value is passed, return an empty array
+    if (typeof oneTrustCookieVal === 'undefined') {
+      return [];
+    }
+    let groupsVal = oneTrustCookieVal.split("groups=")[1];
+    return typeof groupsVal == "undefined"
+      ? []
+      : groupsVal.split("&")[0].split(",");
+  }
+
+  /**
+   * @function getOneTrustCookieValue
+   * @description Returns the value of the OneTrust cookie
+   * @param {String} oneTrustCookie OneTrust cookie value
+   * @returns {String} Returns the value of the OneTrust cookie
+   **/
+  getOneTrustCookieValue(oneTrustCookie) {
+    const regex = /groups=([^&]+)/;
+    const match = oneTrustCookie.match(regex);
+
+    if (match && match[1]) {
+      const groups = match[1];
+      return groups; // Output: 1:1,4:1
+    } else {
+      return decodeURIComponent("groups%3D1%3A1%2C4%3A1");
+    }
+  }
+
+  /**
+   * @function copyCookiePreferences
+   * @description Copies the Intuit cookie preferences to the OneTrust cookie
+   * @param {String} intuitCookie Intuit cookie value
+   * @param {String} oneTrustCookie OneTrust cookie value
+   * @param {String} domain Domain name to set cookie
+   * @returns {String} Returns the updated Intuit cookie value
+   **/
+  copyCookiePreferences(intuitCookie, oneTrustCookie, domain) {
+    let isCookieValueDefined = typeof oneTrustCookie != "undefined";
+
+    if (typeof intuitCookie != "undefined") {
+
+      if (!isCookieValueDefined) {
+        let cookiePreferencesToUpdate = "groups=1:1,4:1";
+        return this.updatePreferences(
+          intuitCookie,
+          cookiePreferencesToUpdate,
+          domain
+        );
+      }
+
+      // check if intuit advertising cookie value is 1 or 0
+      let intuitAdv = intuitCookie.split("|")[1];
+      if (isCookieValueDefined && oneTrustCookie.includes("groups") === false) {
+        let cookiePreferencesToUpdate = oneTrustCookie + '&' + "groups=1:1,4:" + intuitAdv;
+        return this.updatePreferences(
+          intuitCookie,
+          cookiePreferencesToUpdate,
+          domain
+        );
+      }
+
+      if (isCookieValueDefined && this.isAdvertisingDifferent()) {
+        return this.updatePreferences(intuitCookie, oneTrustCookie, domain);
+      }
+    }
+  }
+
+  /**
+   * @function updatePreferences
+   * @description Updates the OneTrust cookie with the Intuit cookie preferences
+   * @param {String} intuitCookie Intuit cookie value
+   * @param {String} oneTrustCookie OneTrust cookie value
+   * @param {String} domainName Domain name to set cookie
+   **/
+  updatePreferences(intuitCookie, oneTrustCookie, domainName) {
+    let isolatedOneTrustGroups = this.isolateOneTrustGroups(oneTrustCookie);
+
+    intuitCookie.split("|").forEach((oneTrustGroupValue, index) => {
+      switch (index) {
+        case 0:
+          isolatedOneTrustGroups[0] = `${this.oneTrustCategories.essential}:${oneTrustGroupValue}`;
+          break;
+        case 1:
+          // 1:1,4:1 (in this case, 1:1 is strictly necessary and 4:1 is advertising - as they're the only two categories)
+          isolatedOneTrustGroups[1] = `${this.oneTrustCategories.advertising}:${oneTrustGroupValue}`;
+          this.oneTrustPreferences[this.oneTrustCategories.advertising] = oneTrustGroupValue;
+          break;
+        default:
+      }
+    });
+
+    let updatedCookieValue = oneTrustCookie.replace(
+      /(groups=)[^&]+/,
+      "$1" + isolatedOneTrustGroups
+    );
+
+    if (domainName) {
+      let expirationDate = new Date();
+      expirationDate.setFullYear(expirationDate.getFullYear() + 1);
+
+      this.setCookie(this.config.oneTrustCookie, updatedCookieValue, {
+        domain: `${domainName}; Samesite=None; secure`,
+        expires: expirationDate
+      });
+    } else {
+      this.setCookie(this.config.oneTrustCookie, updatedCookieValue);
+    }
+
+    return updatedCookieValue;
+  }
+
+  /**
+   * @function getCookieValue
+   * @description Returns the value of specific cookie
+   * @param {String} cookieName
+   * @returns {String} Returns the value of the specific cookie
+   **/
+  static getCookieValue(cookieName) {
+    let cookieVal = document.cookie.split(`${cookieName}=`);
+    if (cookieVal.length === 2) {
+      return decodeURIComponent(cookieVal.pop()?.split(";").shift() || "");
+    }
+  }
+
+  /**
+   * @function encodeCookie
+   * @description Encodes the cookie value
+   * @param {String} cookieName
+   * @param {String} cookieValue
+   * @returns {String} Returns the encoded cookie value
+   **/
+  encodeCookie(cookieName, cookieValue) {
+    let encodedComma = encodeURIComponent(","),
+      encodedColon = encodeURIComponent(":");
+
+    if (
+      cookieName === this.config.oneTrustCookie ||
+      cookieName === this.config.oneTrustBannerCookie
+    ) {
+      cookieValue = cookieValue
+        .replace(/,/g, encodedComma)
+        .replace(/:/g, encodedColon);
+    }
+    return cookieName + "=" + cookieValue;
+  }
+
+  /**
+   * @function setCookie
+   * @description Sets cookies on browser
+   * @param {String} cookieName - Name of the cookie
+   * @param {String} cookieValue - Value of the cookie
+   * @returns {String} Returns complete encoded cookie value
+   **/
+  setCookie(
+    cookieName,
+    cookieValue,
+    {
+      path: cookiePath = "/",
+      expires: cookieExpires,
+      domain: cookieDomain
+    } = {}
+  ) {
+    let encodedCookie = this.encodeCookie(cookieName, cookieValue);
+    if (typeof cookiePath === "string") {
+      encodedCookie += `;path=${cookiePath}`;
+    }
+    if (
+      cookieExpires !== undefined &&
+      typeof cookieExpires.getMonth === "function"
+    ) {
+      encodedCookie += `;expires=${cookieExpires}`;
+    }
+    if (typeof cookieDomain === "string") {
+      encodedCookie += `;domain=${cookieDomain}`;
+    }
+    document.cookie = encodedCookie;
+    return encodedCookie;
+  }
+
+  /**
+   * @function suppressBanner
+   * @description suppresses the OneTrust banner by setting the OneTrust banner cookie
+   * @param {String} domain - Domain name to set cookie
+   **/
+  suppressBanner(domain) {
+    let expirationDate = new Date();
+    expirationDate.setFullYear(expirationDate.getFullYear() + 1);
+
+    this.setCookie(this.config.oneTrustBannerCookie, new Date().toISOString(), {
+      domain: `${domain}; Samesite=None; secure`,
+      expires: expirationDate
+    });
+  }
+
+  /**
+   * @function getLawConfig
+   * @description Returns the law config based on intuit geo specific law cookie
+   * @param {String} intuitCookie - Intuit cookie name
+   * @returns {Object} Returns the law config based on geo
+   * https://github.intuit.com/sbgm/gdpr-util/blob/master/src/lawConfigs.json
+   * **/
+  getLawConfig(intuitCookie) {
+    // Check if this.win.intuit_gdpr and this.win.intuit_gdpr.util are defined
+    if (this.win.intuit_gdpr && this.win.intuit_gdpr.util) {
+      return this.win.intuit_gdpr.util.getLawConfig(intuitCookie);
+    } else {
+      // Handle case where this.win.intuit_gdpr or this.win.intuit_gdpr.util is undefined
+      return this.defaultLawConfig;
+    }
+  }
+
+  /**
+   * @function getAkesGeo
+   * @description Returns the AKAMAI Edge Server Geo from cookies AKES_GEO_OVERRIDE or AKES_GEO
+   * @returns {String} Returns cookie value of country code ~ state code [ex: US~CA]
+   * **/
+  getAkesGeo() {
+    let akesGeoOverride = CookiesConsentWrapper.getCookieValue("AKES_GEO_OVERRIDE");
+    let akesGeo = CookiesConsentWrapper.getCookieValue("AKES_GEO");
+    return akesGeoOverride || akesGeo;
+  }
+
+  /**
+   * @function checkGpcEnabled
+   * @description Returns true if the GPC is enabled from navigator.globalPrivacyControl
+   * @returns {Boolean} Returns true if GPC is enabled
+   * **/
+  checkGpcEnabled() {
+    return navigator.globalPrivacyControl === true;
+  }
+
+  /**
+   * @function optOutGpcUser
+   * @description Returns true if the user has opted out of Global Privacy Control and getAkesGeo determines user is in state of California (US~CA)
+   * @returns {Boolean} Returns true if the user has opted out of Global Privacy Control and is in state of California
+   **/
+  optOutGpcUser(oneTrustCookie) {
+    if (this.overrideGpc) return false; // TEMP: Always return false for now until we are ready to move forward with this feature
+    if (this.gpcEnabled && this.akamaiGeo === "US~CA") {
+      if (!oneTrustCookie) {
+        // dispatch event for listeners - only fire the first time before the cookie is set
+        var event = new Event('gpcOptOut');
+        window.dispatchEvent(event);
+      }
+      return true;
+    } else {
+      return false;
+    }
+  }
+
+  /**
+   * @function setPacflagCookie sets the pacflag cookie when a user makes an explicit change to their preferences
+   */
+  setPacflagCookie() {
+    let expires = new Date();
+    expires.setDate(expires.getDate() + 30);
+    this.setCookie('pacflag', "1", { expires: expires, domain: '.intuit.com' });
+  }
+
+  /**
+   * @function setUserConsent
+   * @description Sets the user consent based on the law config, OneTrust to Intuit preferences mapping and Intuit cookie config
+   * @param {Array} lawConfigEndpoints - Array of law config endpoints
+   * @param {Object} oneTrustToIntuitPreferences - Object containing OneTrust to Intuit preferences mapping
+   * @param {String} intuitCookieConfig - Intuit cookie name used for law config
+   * **/
+  setUserConsent(
+    lawConfigEndpoints,
+    oneTrustToIntuitPreferences,
+    intuitCookieConfig
+  ) {
+    try {
+      this.win.intuit_gdpr.util.setUserConsent(
+        lawConfigEndpoints,
+        oneTrustToIntuitPreferences,
+        () => {
+        },
+        (i) => {
+          logMessage(i, 'gdprEndpointsFailedException', 'error');
+        },
+        intuitCookieConfig
+      );
+      logConsent(oneTrustToIntuitPreferences, OneTrust.getGeolocationData());
+
+    } catch (i) {
+      logMessage(JSON.stringify({
+        message: i.message, hasGdprUtil: typeof this.win.intuit_gdpr != "undefined"
+      }), 'setUserConsentException', 'error')
+    }
+  }
+
+  /**
+   * @function mapOneTrustToIntuitPreferences
+   * @description Maps OneTrust preferences to Intuit preferences based on law config and OneTrust active groups
+   * @param {Object} lawConfig - Law config based on geo
+   * @returns {Object} Returns the mapped OneTrust to Intuit preferences
+   **/
+  mapOneTrustToIntuitPreferences(lawConfig, optanonActiveGroups = null) {
+    if (optanonActiveGroups === null) {
+      optanonActiveGroups = window.OptanonActiveGroups;
+    }
+    return lawConfig.checkboxes.reduce((acc, current) => {
+      const intuitCategoryId = current.value;
+      const oneTrustCategoryId = this.intuitToOnetrustMap[intuitCategoryId];
+      if (oneTrustCategoryId === this.oneTrustCategories.essential) {
+        acc[current.value] = true;
+      } else if (optanonActiveGroups) {
+        acc[current.value] = optanonActiveGroups.includes(oneTrustCategoryId);
+      } else {
+        // set default value [opt-in] if optanonActiveGroups is not defined and adv is not set
+        acc[current.value] = true;
+      }
+      return acc;
+    }, {});
+  }
+
+  /**
+   * @function isAdvertisingDifferent
+   * @description Checks if the advertising preferences are different between Intuit and OneTrust
+   * @returns {Boolean} Returns true if the advertising preferences are different between Intuit and OneTrust
+   **/
+  isAdvertisingDifferent() {
+    let oneTrustAdvertisingPref =
+      this.oneTrustPreferences[this.oneTrustCategories.advertising],
+      intuitAdvertisingPreference =
+        this.intuitPreferences[this.intuitToOnetrustMap.advertising_permission];
+    // Check if both preferences are defined before comparison
+    if (oneTrustAdvertisingPref !== undefined && intuitAdvertisingPreference !== undefined) {
+      return oneTrustAdvertisingPref !== intuitAdvertisingPreference;
+    }
+    // Return true if any preference is undefined (indicating difference)
+    return true;
+  }
+
+  /**
+   * @function shouldSyncPreferences
+   * @description sync preferences if not set or intuitCookie and oneTrustCookie do not have the same value for advertising_permission
+   * @returns {Boolean} Returns true if preferences should be synced
+   **/
+  shouldSyncPreferences(optanonActiveGroups = null) {
+    if (optanonActiveGroups === null) {
+      optanonActiveGroups = window.OptanonActiveGroups;
+    }
+    // intuitCookieVal expects format of 1|1 or 1|0
+    let intuitCookieVal = CookiesConsentWrapper.getCookieValue(this.config.intuitCookie);
+
+    // set default intuit cookie value if intuit does not exist
+    if (!intuitCookieVal) {
+      return true;
+    }
+    // cookiesConsentWrapper.mapIntuitPrefsToOneTrustCats(intuitCookieVal) returns object ex: {"1": "1","4": "1"}
+    // [this.intuitToOnetrustMap.advertising_permission] returns category number ex: "4"
+    // return value of advertising_permission from the object
+    let intuitAdvPref = this.mapIntuitPrefsToOneTrustCats(intuitCookieVal)[this.intuitToOnetrustMap.advertising_permission];
+
+    // if intuitAdvPref is undefined, return true to initiate sync and not drop into following checks
+    if (typeof intuitAdvPref === 'undefined') {
+      return true;
+    }
+
+    // check if the OneTrust categories on window contains the advertisting catefory number
+    let oneTrustHasAdvCat = optanonActiveGroups.includes(
+      this.oneTrustCategories.advertising,
+    );
+    // if intuit's cookie preferences equals oneTrusts disabled value and OneTrust has advertising category, return true
+    if ((intuitAdvPref === this.categoryDisabled && oneTrustHasAdvCat === true)
+      // if intuit's adver preferences equals oneTrusts enabled value of "1" and OneTrust does not have advertising category, return true
+      || (intuitAdvPref === this.categoryEnabled && oneTrustHasAdvCat === false)) {
+      return true;
+    }
+    // if preferences are different, return true
+    if (this.isAdvertisingDifferent()) {
+      return true;
+    }
+    // return false if no conditions are met
+    return false;
+  }
+
+  /**
+   * @function syncPreferences
+   * @description Syncs consent preferences between Intuit and OneTrust
+   * **/
+  syncPreferences() {
+    if (this.shouldSyncPreferences() === true) {
+      // LOG Event and dispatch event for listeners
+      var event = new Event('OneTrustConsentChanged');
+      window.dispatchEvent(event);
+      let lawConfig = this.getLawConfig(this.config.intuitCookie);
+      if (Object.keys(lawConfig).length === 0) {
+        return;
+      }
+      let oneTrustToIntuitPreferences =
+        this.mapOneTrustToIntuitPreferences(lawConfig);
+      this.setUserConsent(
+        lawConfig.endpoints,
+        oneTrustToIntuitPreferences,
+        this.config.intuitCookie
+      );
+      // update config with the new preferences (cookiesConsentWrapper.intuitPreferences  && cookiesConsentWrapper.oneTrustPreferences)
+      this.mapIntuitPrefsToOneTrustCats(CookiesConsentWrapper.getCookieValue(this.config.intuitCookie));
+      this.getOneTrustPreferences(CookiesConsentWrapper.getCookieValue(this.config.oneTrustCookie));
+    }
+  }
+}
+
+
+window.OptanonWrapper = function () {
+  // expose class to window
+  window.cookiesConsentWrapper = new CookiesConsentWrapper();
+  window.dataLayer.push({event:'OneTrustLoaded'})
+  //OneTrust Cookies On Consent Listener to updates from the Cookie consent manager
+  OneTrust.OnConsentChanged(function (e) {
+    // set pacflag (preauth consent) cookie when user makes a change to their preferences
+    window.cookiesConsentWrapper.setPacflagCookie();
+    window.cookiesConsentWrapper.syncPreferences();
+  }); // End Consent Change Listener  
+};
+
+// Overriding legacy modal to call OneTrust modal when OneTrust is enabled
+if (!window.intuit_gdpr) {
+  window.intuit_gdpr = {};
+}
+if (!window.intuit_gdpr.showCookiePreference) {
+  window.intuit_gdpr.showCookiePreference = () => {
+    window.OneTrust?.ToggleInfoDisplay();
+  };
+}
